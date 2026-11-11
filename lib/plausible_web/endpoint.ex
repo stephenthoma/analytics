@@ -21,7 +21,7 @@ defmodule PlausibleWeb.Endpoint do
 
   socket("/live", Phoenix.LiveView.Socket,
     websocket: [
-      check_origin: true,
+      check_origin: {__MODULE__, :websocket_origin_allowed?, []},
       connect_info: [
         :peer_data,
         :uri,
@@ -127,7 +127,8 @@ defmodule PlausibleWeb.Endpoint do
         # is used to inject the domain - this way we can authenticate
         # websocket requests within single root domain, in case websocket_url()
         # returns a ws{s}:// scheme (in which case SameSite=Lax is not applicable).
-        Keyword.put(@session_options, :domain, host())
+        @session_options
+        |> maybe_put_cookie_domain()
         |> Keyword.put(:key, "_plausible_#{Application.fetch_env!(:plausible, :environment)}")
       else
         # CE setup is simpler and we don't need to worry about WS domain being different
@@ -136,6 +137,28 @@ defmodule PlausibleWeb.Endpoint do
 
     session_options
     |> Keyword.put(:secure, secure_cookie?())
+  end
+
+  @doc false
+  # Equivalent to `check_origin: true` (origin host must match the endpoint
+  # host), except in development, where the app is often reached through
+  # other hosts such as 127.0.0.1 or a preview proxy.
+  def websocket_origin_allowed?(%URI{host: origin_host}) do
+    Application.get_env(:plausible, :environment) == "dev" or origin_host == host()
+  end
+
+  on_ee do
+    # In development the app is often reached through hosts other than
+    # BASE_URL (e.g. 127.0.0.1 or a preview proxy). Browsers reject a cookie
+    # whose Domain does not match the request host, which breaks the session
+    # and CSRF protection, so leave the cookie host-only there.
+    defp maybe_put_cookie_domain(session_options) do
+      if Application.get_env(:plausible, :environment) == "dev" do
+        session_options
+      else
+        Keyword.put(session_options, :domain, host())
+      end
+    end
   end
 
   defp config!(key) do
