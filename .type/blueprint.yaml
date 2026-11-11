@@ -1,0 +1,623 @@
+initialize: |
+  # Install system packages and runtimes for plausible/analytics (Debian/Ubuntu x86_64).
+  set -euo pipefail
+
+  OTP_VERSION=28.5.0.5
+  ELIXIR_VERSION=1.20.4
+  NODE_VERSION=24.22.1
+  CLICKHOUSE_VERSION=25.11.5.8
+  PG_MAJOR=18
+  TOOLS="$HOME/.local/plausible-tools"
+  mkdir -p "$TOOLS"
+
+  export DEBIAN_FRONTEND=noninteractive
+  sudo apt-get update -y
+  sudo apt-get install -y --no-install-recommends \
+    ca-certificates curl gnupg unzip xz-utils build-essential git \
+    libssl3 libncurses6 libstdc++6 inotify-tools lsb-release
+
+  # PostgreSQL 18 from the PGDG apt repo (matches CI/prod major version)
+  if ! [ -x /usr/lib/postgresql/$PG_MAJOR/bin/postgres ]; then
+    sudo install -d /usr/share/postgresql-common/pgdg
+    sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+    echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+      | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+    sudo apt-get update -y
+    sudo apt-get install -y --no-install-recommends postgresql-$PG_MAJOR postgresql-client-$PG_MAJOR
+  fi
+
+  # ClickHouse (same version as CI) as a standalone static binary
+  if ! [ -x "$TOOLS/clickhouse/clickhouse" ] || ! "$TOOLS/clickhouse/clickhouse" --version | grep -q "$CLICKHOUSE_VERSION"; then
+    mkdir -p "$TOOLS/clickhouse"
+    curl -fsSL "https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}-stable/clickhouse-common-static-${CLICKHOUSE_VERSION}-amd64.tgz" -o /tmp/ch.tgz
+    tar -xzf /tmp/ch.tgz -C /tmp
+    cp "/tmp/clickhouse-common-static-${CLICKHOUSE_VERSION}/usr/bin/clickhouse" "$TOOLS/clickhouse/clickhouse"
+    rm -rf /tmp/ch.tgz "/tmp/clickhouse-common-static-${CLICKHOUSE_VERSION}"
+  fi
+
+  # Erlang/OTP (precompiled Hex build for ubuntu-24.04, compatible with Debian 13)
+  if ! [ -x "$TOOLS/otp-$OTP_VERSION/bin/erl" ]; then
+    curl -fsSL "https://builds.hex.pm/builds/otp/amd64/ubuntu-24.04/OTP-${OTP_VERSION}.tar.gz" -o /tmp/otp.tgz
+    rm -rf "$TOOLS/otp-$OTP_VERSION" && mkdir -p "$TOOLS/otp-$OTP_VERSION"
+    tar -xzf /tmp/otp.tgz -C "$TOOLS/otp-$OTP_VERSION" --strip-components=1
+    (cd "$TOOLS/otp-$OTP_VERSION" && ./Install -minimal "$TOOLS/otp-$OTP_VERSION" >/dev/null)
+    rm -f /tmp/otp.tgz
+  fi
+
+  # Elixir (precompiled for OTP 28)
+  if ! [ -x "$TOOLS/elixir-$ELIXIR_VERSION/bin/elixir" ]; then
+    curl -fsSL "https://builds.hex.pm/builds/elixir/v${ELIXIR_VERSION}-otp-28.zip" -o /tmp/elixir.zip
+    rm -rf "$TOOLS/elixir-$ELIXIR_VERSION" && mkdir -p "$TOOLS/elixir-$ELIXIR_VERSION"
+    unzip -q /tmp/elixir.zip -d "$TOOLS/elixir-$ELIXIR_VERSION"
+    rm -f /tmp/elixir.zip
+  fi
+
+  # Node.js
+  if ! [ -x "$TOOLS/node-v$NODE_VERSION/bin/node" ]; then
+    curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" -o /tmp/node.txz
+    mkdir -p "$TOOLS/node-v$NODE_VERSION"
+    tar -xJf /tmp/node.txz -C "$TOOLS/node-v$NODE_VERSION" --strip-components=1
+    rm -f /tmp/node.txz
+  fi
+
+  # Shell env file used by maintenance / dev-server instructions
+  cat > "$TOOLS/env.sh" <<EOF
+  export PATH="$TOOLS/node-v$NODE_VERSION/bin:$TOOLS/elixir-$ELIXIR_VERSION/bin:$TOOLS/otp-$OTP_VERSION/bin:$TOOLS/clickhouse:/usr/lib/postgresql/$PG_MAJOR/bin:\$PATH"
+  export MIX_HOME="\$HOME/.mix"
+  export HEX_HOME="\$HOME/.hex"
+  export LANG=C.UTF-8
+  EOF
+
+  . "$TOOLS/env.sh"
+  mix local.hex --force --if-missing
+  mix local.rebar --force --if-missing
+  erl -noshell -eval 'io:format("~s~n",[erlang:system_info(otp_release)]), halt().'
+  elixir --version | tail -1
+  node -v
+  clickhouse --version | head -1
+  postgres --version
+
+  # --- Helper scripts used by Type's saved setup/run commands (written outside the repo) ---
+  cat > "$TOOLS/services.sh" <<'SERVICES_EOF'
+  #!/usr/bin/env bash
+  # Start (or confirm) local Postgres 18 and ClickHouse for Plausible dev. Idempotent.
+  set -euo pipefail
+  . "$HOME/.local/plausible-tools/env.sh"
+
+  # Postgres: Debian cluster 18/main on 127.0.0.1:5432, user postgres/postgres
+  if ! pg_isready -h 127.0.0.1 -p 5432 -q; then
+    sudo pg_ctlcluster 18 main start
+  fi
+  timeout 60 sh -c 'until pg_isready -h 127.0.0.1 -p 5432 -q; do sleep 1; done'
+  sudo -u postgres psql -qtAc "ALTER USER postgres PASSWORD 'postgres';" >/dev/null
+
+  # ClickHouse: single local server, HTTP 8123 / native 9000, default user without password
+  CH_DIR="$HOME/.local/plausible-data/clickhouse"
+  mkdir -p "$CH_DIR/logs" "$CH_DIR/data" "$CH_DIR/tmp" "$CH_DIR/user_files" "$CH_DIR/format_schemas"
+  if ! curl -sf http://127.0.0.1:8123/ping >/dev/null; then
+    (cd "$CH_DIR" && nohup clickhouse server -- \
+       --path="$CH_DIR/data/" \
+       --tmp_path="$CH_DIR/tmp/" \
+       --user_files_path="$CH_DIR/user_files/" \
+       --format_schema_path="$CH_DIR/format_schemas/" \
+       --logger.log="$CH_DIR/logs/clickhouse.log" \
+       --logger.errorlog="$CH_DIR/logs/clickhouse.err.log" \
+       --logger.level=warning \
+       --http_port=8123 --tcp_port=9000 \
+       --listen_host=127.0.0.1 \
+       --mysql_port=0 --postgresql_port=0 \
+       > "$CH_DIR/logs/stdout.log" 2>&1 &)
+  fi
+  timeout 90 sh -c 'until curl -sf http://127.0.0.1:8123/ping >/dev/null; do sleep 1; done'
+  echo "postgres: $(pg_isready -h 127.0.0.1 -p 5432)"
+  echo "clickhouse: $(curl -s 'http://127.0.0.1:8123/?query=SELECT%20version()')"
+  SERVICES_EOF
+
+  cat > "$TOOLS/start.sh" <<'START_EOF'
+  #!/usr/bin/env bash
+  # Start services, prepare DBs (idempotent), seed once, then run Phoenix on :8000 (foreground).
+  set -euo pipefail
+  . "$HOME/.local/plausible-tools/env.sh"
+  export MIX_ENV=dev
+  bash "$HOME/.local/plausible-tools/services.sh"
+
+  mix ecto.create
+  mix ecto.migrate
+
+  # Seed only when the seeded dev user is missing
+  if [ "$(psql postgres://postgres:postgres@127.0.0.1:5432/plausible_dev -tAc "select count(*) from users where email='user@plausible.test'")" = "0" ]; then
+    mix run priv/repo/seeds.exs
+  fi
+
+  exec mix phx.server
+  START_EOF
+
+  cat > "$TOOLS/maintenance.sh" <<'MAINT_EOF'
+  #!/usr/bin/env bash
+  # Incremental dependency install / build prep. No services required, no servers started.
+  set -euo pipefail
+  . "$HOME/.local/plausible-tools/env.sh"
+  export MIX_ENV=dev
+
+  mix local.hex --force --if-missing
+  mix local.rebar --force --if-missing
+  mix deps.get
+  mix deps.compile
+  mix compile
+  [ -s priv/geodb/dbip-country.mmdb.gz ] || mix download_country_database
+
+  npm ci --prefix assets --no-audit --no-fund
+  npm ci --prefix tracker --no-audit --no-fund
+  npm run deploy --prefix tracker
+
+  mix assets.setup
+  MAINT_EOF
+
+  cat > "$TOOLS/construct-recipe.json" <<'RECIPE_EOF'
+  {
+    "id": "analytics-dev-workflow",
+    "name": "Analytics dev: sign in, view seeded dashboard, add a site, ingest a pageview",
+    "outcomes": [
+      {
+        "id": "sign-in",
+        "description": "Seeded dev user signs in and sees the dummy.site site list",
+        "startStep": 2,
+        "endStep": 7
+      },
+      {
+        "id": "dashboard",
+        "description": "dummy.site dashboard shows seeded visitor stats and sources",
+        "startStep": 8,
+        "endStep": 10
+      },
+      {
+        "id": "add-site",
+        "description": "A newly added site appears in the site list after reload",
+        "startStep": 11,
+        "endStep": 16
+      },
+      {
+        "id": "ingest",
+        "description": "A pageview sent to /api/event shows up on the new site's dashboard",
+        "startStep": 18,
+        "endStep": 22
+      }
+    ],
+    "steps": [
+      {
+        "action": "exec",
+        "command": "sh",
+        "args": [
+          "-c",
+          ". \"$HOME/.local/plausible-tools/env.sh\" && MIX_ENV=dev mix run --no-start -e 'Application.ensure_all_started(:ecto_sql); {:ok, _} = Plausible.Repo.start_link(log: false); import Ecto.Query; sites = Plausible.Repo.all(from s in Plausible.Site, where: like(s.domain, \"construct-%.test\")); Enum.each(sites, &Plausible.Site.Removal.run/1); IO.puts(\"removed #{length(sites)} old construct sites\")' 2>/dev/null"
+        ],
+        "timeoutMs": 120000,
+        "note": "setup: remove sites left by earlier verification runs (trial plan allows 10 sites per team)"
+      },
+      {
+        "action": "goto",
+        "path": "/login"
+      },
+      {
+        "action": "fill",
+        "target": {
+          "by": "label",
+          "value": "Email"
+        },
+        "value": "{env:PLAUSIBLE_DEV_EMAIL}"
+      },
+      {
+        "action": "fill",
+        "target": {
+          "by": "label",
+          "value": "Password"
+        },
+        "value": "{env:PLAUSIBLE_DEV_PASSWORD}"
+      },
+      {
+        "action": "click",
+        "target": {
+          "by": "role",
+          "role": "button",
+          "name": "Sign in"
+        }
+      },
+      {
+        "action": "assert-visible-any",
+        "targets": [
+          {
+            "by": "text",
+            "value": "dummy.site"
+          }
+        ]
+      },
+      {
+        "action": "assert-text",
+        "selector": "body",
+        "value": "visitors in last 24h",
+        "note": "wait until the site cards finish loading their 24h visitor stats"
+      },
+      {
+        "action": "goto",
+        "path": "/dummy.site?period=30d"
+      },
+      {
+        "action": "assert-text",
+        "selector": "body",
+        "value": "UNIQUE VISITORS"
+      },
+      {
+        "action": "assert-text",
+        "selector": "body",
+        "value": "opensource.com"
+      },
+      {
+        "action": "goto",
+        "path": "/sites/new"
+      },
+      {
+        "action": "fill",
+        "target": {
+          "by": "label",
+          "value": "Domain"
+        },
+        "value": "construct-{run:id}.test"
+      },
+      {
+        "action": "click",
+        "target": {
+          "by": "role",
+          "role": "button",
+          "name": "Add site"
+        }
+      },
+      {
+        "action": "assert-visible-any",
+        "targets": [
+          {
+            "by": "role",
+            "role": "button",
+            "name": "Create team"
+          }
+        ],
+        "note": "site created; app continues to the team setup step of the onboarding flow"
+      },
+      {
+        "action": "goto",
+        "path": "/sites"
+      },
+      {
+        "action": "assert-text",
+        "selector": "body",
+        "value": "construct-{run:id}.test"
+      },
+      {
+        "action": "exec",
+        "command": "sleep",
+        "args": [
+          "32"
+        ],
+        "note": "wait for Plausible.Site.Cache RecentlyUpdated refresh (30s) so ingestion accepts the new domain",
+        "timeoutMs": 45000
+      },
+      {
+        "action": "request",
+        "method": "POST",
+        "path": "/api/event",
+        "session": false,
+        "headers": {
+          "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36",
+          "Content-Type": "application/json"
+        },
+        "json": {
+          "name": "pageview",
+          "url": "http://construct-{run:id}.test/hello-{run:id}",
+          "domain": "construct-{run:id}.test"
+        }
+      },
+      {
+        "action": "assert-response",
+        "status": 202,
+        "header": {
+          "name": "content-type",
+          "contains": "text/plain"
+        }
+      },
+      {
+        "action": "exec",
+        "command": "sleep",
+        "args": [
+          "7"
+        ],
+        "note": "wait for the ClickHouse write buffer flush (CLICKHOUSE_FLUSH_INTERVAL_MS=5000)",
+        "timeoutMs": 15000
+      },
+      {
+        "action": "goto",
+        "path": "/construct-{run:id}.test?period=day"
+      },
+      {
+        "action": "assert-text",
+        "selector": "body",
+        "value": "/hello-{run:id}"
+      }
+    ]
+  }
+  RECIPE_EOF
+  chmod +x "$TOOLS"/*.sh
+maintenance: |
+  set -euo pipefail
+  # Establish runtimes/PATH independently of initialize (same layout initialize creates)
+  TOOLS="$HOME/.local/plausible-tools"
+  export PATH="$TOOLS/node-v24.22.1/bin:$TOOLS/elixir-1.20.4/bin:$TOOLS/otp-28.5.0.5/bin:$TOOLS/clickhouse:/usr/lib/postgresql/18/bin:$PATH"
+  export MIX_HOME="$HOME/.mix" HEX_HOME="$HOME/.hex" LANG=C.UTF-8 MIX_ENV=dev
+  if [ -n "${ENVRC:-}" ]; then
+    echo "export PATH=\"$PATH\" MIX_HOME=\"$MIX_HOME\" HEX_HOME=\"$HEX_HOME\" LANG=C.UTF-8" >> "$ENVRC"
+  fi
+
+  mix local.hex --force --if-missing
+  mix local.rebar --force --if-missing
+  mix deps.get
+  mix deps.compile
+  mix compile
+  [ -s priv/geodb/dbip-country.mmdb.gz ] || mix download_country_database
+
+  npm ci --prefix assets --no-audit --no-fund
+  npm ci --prefix tracker --no-audit --no-fund
+  npm run deploy --prefix tracker
+
+  mix assets.setup
+knowledge:
+- name: overview
+  contents: |
+    Plausible Analytics (Elixir/Phoenix + React dashboard), EE variant, MIX_ENV=dev.
+    Runtimes (from .tool-versions): Erlang/OTP 28.5.0.5 (Hex precompiled ubuntu-24.04 build), Elixir 1.20.4-otp-28, Node.js 24.22.1.
+    Services (native, no Docker): PostgreSQL 18 (PGDG apt, Debian cluster 18/main on 127.0.0.1:5432, user postgres / password postgres)
+    and ClickHouse 25.11.5.8 (static binary, HTTP 127.0.0.1:8123, native 9000, default user without password, data in $HOME/.local/plausible-data/clickhouse).
+    These match CI (postgres:18, clickhouse-server:25.11.5.8). Docker is installed in the Type sandbox but its daemon is not running, so services run natively.
+    Tools live in $HOME/.local/plausible-tools; `. $HOME/.local/plausible-tools/env.sh` sets PATH/MIX_HOME/HEX_HOME.
+    Dev config comes from the committed config/.env.dev (DATABASE_URL, CLICKHOUSE_DATABASE_URL, BASE_URL=http://localhost:8000, dev SECRET_KEY_BASE). No external secrets are needed.
+    Platform: Linux x86_64 (Debian 13 trixie verified). Initialize uses sudo apt-get.
+- name: dev-server
+  contents: |
+    Start/restart (Type saved run command): bash "$HOME/.local/plausible-tools/start.sh"
+    It runs, in order:
+      1. services.sh: `sudo pg_ctlcluster 18 main start` (if pg_isready fails), wait for pg_isready, ensure postgres password 'postgres';
+         start `clickhouse server` in the background with --path=$HOME/.local/plausible-data/clickhouse/data/ --http_port=8123 --tcp_port=9000 --listen_host=127.0.0.1, wait for /ping.
+      2. mix ecto.create && mix ecto.migrate (idempotent; Postgres + ClickHouse repos).
+      3. If user@plausible.test is missing in plausible_dev: mix run priv/repo/seeds.exs (seeds dummy.site with ~6 months of stats).
+      4. exec mix phx.server -> http://localhost:8000 (dev watchers: esbuild, tailwind, tsc --watch, tracker deploy).
+    Both services must be restarted in every new sandbox (snapshots keep data, not processes). Postgres before ClickHouse before Phoenix.
+    Stop: kill the mix phx.server process; `sudo pg_ctlcluster 18 main stop`; `pkill -f 'clickhouse server'`.
+    Reset dev data: MIX_ENV=dev mix ecto.reset && mix run priv/repo/seeds.exs.
+- name: login
+  contents: |
+    Supported dev login (documented in CONTRIBUTING.md, created by priv/repo/seeds.exs):
+    email user@plausible.test, password plausible, at http://localhost:8000/login (button "Sign in").
+    These are public dev-seed values, not secrets. For Construct they are passed as env vars PLAUSIBLE_DEV_EMAIL / PLAUSIBLE_DEV_PASSWORD
+    and referenced as {env:...} in the recipe. Construct redacts the password value, so the word "plausible" appears as [PLAUSIBLE_DEV_PASSWORD] in text artifacts.
+    The seeded user's team is on a trial with a 10-site limit: the Domain field on /sites/new becomes disabled when the team has 10 sites.
+- name: verify
+  contents: |
+    Bounded health checks (app running):
+      pg_isready -h 127.0.0.1 -p 5432
+      curl -sf http://127.0.0.1:8123/ping
+      curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/login   # expect 200
+      construct check-app --base-url http://localhost:8000/login           # no problems; 404 for /js/pa-invalid-script-id.js is the app's own dev self-tracking script and expected
+
+    Construct end-to-end workflow (passed in the setup sandbox, final recorded run + independent review):
+      cd <repo checkout>
+      export PLAUSIBLE_DEV_EMAIL=user@plausible.test PLAUSIBLE_DEV_PASSWORD=plausible
+      construct --base-url http://localhost:8000/ --repo "$PWD" --steps "$HOME/.local/plausible-tools/construct-recipe.json"        # add --fast while iterating
+    Recipe (written by initialize to $HOME/.local/plausible-tools/construct-recipe.json; full JSON in the 'construct-recipe' entry):
+      setup: exec mix run that removes construct-*.test sites from earlier runs via Plausible.Site.Removal (keeps the team under the 10-site trial limit)
+      sign-in: log in with the seeded user, assert dummy.site is listed and the cards show "visitors in last 24h" (stats loaded)
+      dashboard: /dummy.site?period=30d shows UNIQUE VISITORS and the opensource.com source
+      add-site: /sites/new, add construct-{run:id}.test, onboarding moves to "Create team", /sites lists the new domain
+      (setup) sleep 32s: new domains are accepted by ingestion only after Plausible.Site.Cache RecentlyUpdated refresh (30s interval)
+      ingest: POST /api/event pageview for the new domain -> 202 text/plain "ok"; after the 5s ClickHouse buffer flush, /construct-{run:id}.test?period=day lists /hello-{run:id}
+    Gotchas: the site "Delete" button uses a JS confirm dialog Construct cannot accept, so cleanup is done in the setup exec step.
+    After Add site, wait for the next page before navigating, or the LiveView redirect aborts the goto.
+- name: construct-recipe
+  contents: |
+    {
+      "id": "analytics-dev-workflow",
+      "name": "Analytics dev: sign in, view seeded dashboard, add a site, ingest a pageview",
+      "outcomes": [
+        {
+          "id": "sign-in",
+          "description": "Seeded dev user signs in and sees the dummy.site site list",
+          "startStep": 2,
+          "endStep": 7
+        },
+        {
+          "id": "dashboard",
+          "description": "dummy.site dashboard shows seeded visitor stats and sources",
+          "startStep": 8,
+          "endStep": 10
+        },
+        {
+          "id": "add-site",
+          "description": "A newly added site appears in the site list after reload",
+          "startStep": 11,
+          "endStep": 16
+        },
+        {
+          "id": "ingest",
+          "description": "A pageview sent to /api/event shows up on the new site's dashboard",
+          "startStep": 18,
+          "endStep": 22
+        }
+      ],
+      "steps": [
+        {
+          "action": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            ". \"$HOME/.local/plausible-tools/env.sh\" && MIX_ENV=dev mix run --no-start -e 'Application.ensure_all_started(:ecto_sql); {:ok, _} = Plausible.Repo.start_link(log: false); import Ecto.Query; sites = Plausible.Repo.all(from s in Plausible.Site, where: like(s.domain, \"construct-%.test\")); Enum.each(sites, &Plausible.Site.Removal.run/1); IO.puts(\"removed #{length(sites)} old construct sites\")' 2>/dev/null"
+          ],
+          "timeoutMs": 120000,
+          "note": "setup: remove sites left by earlier verification runs (trial plan allows 10 sites per team)"
+        },
+        {
+          "action": "goto",
+          "path": "/login"
+        },
+        {
+          "action": "fill",
+          "target": {
+            "by": "label",
+            "value": "Email"
+          },
+          "value": "{env:PLAUSIBLE_DEV_EMAIL}"
+        },
+        {
+          "action": "fill",
+          "target": {
+            "by": "label",
+            "value": "Password"
+          },
+          "value": "{env:PLAUSIBLE_DEV_PASSWORD}"
+        },
+        {
+          "action": "click",
+          "target": {
+            "by": "role",
+            "role": "button",
+            "name": "Sign in"
+          }
+        },
+        {
+          "action": "assert-visible-any",
+          "targets": [
+            {
+              "by": "text",
+              "value": "dummy.site"
+            }
+          ]
+        },
+        {
+          "action": "assert-text",
+          "selector": "body",
+          "value": "visitors in last 24h",
+          "note": "wait until the site cards finish loading their 24h visitor stats"
+        },
+        {
+          "action": "goto",
+          "path": "/dummy.site?period=30d"
+        },
+        {
+          "action": "assert-text",
+          "selector": "body",
+          "value": "UNIQUE VISITORS"
+        },
+        {
+          "action": "assert-text",
+          "selector": "body",
+          "value": "opensource.com"
+        },
+        {
+          "action": "goto",
+          "path": "/sites/new"
+        },
+        {
+          "action": "fill",
+          "target": {
+            "by": "label",
+            "value": "Domain"
+          },
+          "value": "construct-{run:id}.test"
+        },
+        {
+          "action": "click",
+          "target": {
+            "by": "role",
+            "role": "button",
+            "name": "Add site"
+          }
+        },
+        {
+          "action": "assert-visible-any",
+          "targets": [
+            {
+              "by": "role",
+              "role": "button",
+              "name": "Create team"
+            }
+          ],
+          "note": "site created; app continues to the team setup step of the onboarding flow"
+        },
+        {
+          "action": "goto",
+          "path": "/sites"
+        },
+        {
+          "action": "assert-text",
+          "selector": "body",
+          "value": "construct-{run:id}.test"
+        },
+        {
+          "action": "exec",
+          "command": "sleep",
+          "args": [
+            "32"
+          ],
+          "note": "wait for Plausible.Site.Cache RecentlyUpdated refresh (30s) so ingestion accepts the new domain",
+          "timeoutMs": 45000
+        },
+        {
+          "action": "request",
+          "method": "POST",
+          "path": "/api/event",
+          "session": false,
+          "headers": {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36",
+            "Content-Type": "application/json"
+          },
+          "json": {
+            "name": "pageview",
+            "url": "http://construct-{run:id}.test/hello-{run:id}",
+            "domain": "construct-{run:id}.test"
+          }
+        },
+        {
+          "action": "assert-response",
+          "status": 202,
+          "header": {
+            "name": "content-type",
+            "contains": "text/plain"
+          }
+        },
+        {
+          "action": "exec",
+          "command": "sleep",
+          "args": [
+            "7"
+          ],
+          "note": "wait for the ClickHouse write buffer flush (CLICKHOUSE_FLUSH_INTERVAL_MS=5000)",
+          "timeoutMs": 15000
+        },
+        {
+          "action": "goto",
+          "path": "/construct-{run:id}.test?period=day"
+        },
+        {
+          "action": "assert-text",
+          "selector": "body",
+          "value": "/hello-{run:id}"
+        }
+      ]
+    }
+- name: lint-test-build
+  contents: |
+    Format/lint: mix format --check-formatted; mix credo; npm --prefix assets run lint (see .github/workflows/elixir.yml, node.yml).
+    Backend tests: MIX_ENV=test mix test (needs Postgres + ClickHouse running; creates plausible_test DBs). CE variant: MIX_ENV=ce_test mix test.
+    Dashboard tests: npm --prefix assets test. Tracker: npm --prefix tracker test (Playwright).
+    E2E: npm --prefix e2e install && npx --prefix e2e playwright install && mix test.e2e.
+    Compile check: mix compile --warnings-as-errors. Full suites were not run during environment setup.
+- name: secrets-and-limits
+  contents: |
+    Required secrets: none for the dev workflow. Optional integrations (Google, Paddle, Postmark, MaxMind, Sentry, etc.) read env vars in config/runtime.exs and stay disabled when unset.
+    Resource notes: first maintenance run ~8 min on 48 cores (mix deps.compile + compile dominate); seeding ~1 min. Root overlay is ~10 GB; tools + deps + data use ~3-4 GB.
+    Optional services not set up: MinIO (imports/exports), SAML IdP (SSO), browserless. Use `make minio` etc. only if Docker is available.
